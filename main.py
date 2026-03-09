@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from typing import Optional, Dict, List
 
 import cv2
+
+# Pipeline debug logging (set DEBUG_PIPELINE=1 to enable)
+_DEBUG = os.environ.get("DEBUG_PIPELINE", "0") == "1"
+logger = logging.getLogger("potato_pipeline")
 import yaml
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
@@ -268,9 +273,16 @@ class FrameProcessor(QtCore.QObject):
 
         # Detection + tracking (ByteTrack via Ultralytics) on ROI-restricted frame
         detections = self.detector.track(detect_frame)
+        if _DEBUG and detections:
+            for d in detections:
+                if d.track_id is None:
+                    logger.error("Pipeline: detection exists but no track_id (frame %d)", self._frame_index)
 
         # Restrict detections to ROI region (safety filter)
+        before_roi = len(detections)
         detections = self._filter_by_polygon(detections, self.roi_polygon)
+        if _DEBUG and before_roi != len(detections):
+            logger.debug("ROI filter: %d -> %d detections", before_roi, len(detections))
 
         # Suppress overlapping multi-class detections (keep highest confidence only)
         detections = self._suppress_overlaps(detections, iou_threshold=0.5)
@@ -285,6 +297,11 @@ class FrameProcessor(QtCore.QObject):
         countable_ids = set(self._final_classes.keys())
         prev_total = self.counter.total_count
         new_total = self.counter.update(detections, countable_ids=countable_ids)
+
+        if _DEBUG and self.counter.newly_counted_ids:
+            for tid in self.counter.newly_counted_ids:
+                cls_val = self._final_classes.get(tid, "?")
+                logger.debug("Counted id=%d class=%s total=%d", tid, cls_val, new_total)
 
         # Update statistics and DB only for newly counted track IDs,
         # and only once a final class from Define Zone is available.
@@ -501,6 +518,8 @@ class FrameProcessor(QtCore.QObject):
                 conf = float(det.confidence)
                 history = self._id_class_history.setdefault(track_id, [])
                 history.append((cls_name, conf))
+                if _DEBUG and len(history) == 1:
+                    logger.debug("DEFINE zone: id=%d entered, first prediction %s %.2f", track_id, cls_name, conf)
 
             # Detect transition: leaving Define Zone
             if was_inside and not inside:
@@ -525,6 +544,10 @@ class FrameProcessor(QtCore.QObject):
 
                     if best_cls is not None:
                         self._final_classes[track_id] = best_cls
+                        if _DEBUG:
+                            logger.debug("DEFINE zone: id=%d exited, assigned final class=%s", track_id, best_cls)
+                    elif _DEBUG:
+                        logger.warning("DEFINE zone: id=%d exited but no class assigned (history len=%d)", track_id, total_obs)
 
             # Update inside-flag for next frame
             self._define_zone_inside[track_id] = inside
@@ -557,6 +580,8 @@ class FrameProcessor(QtCore.QObject):
 
                 if best_cls is not None:
                     self._final_classes[track_id] = best_cls
+                    if _DEBUG:
+                        logger.debug("DEFINE zone: id=%d disappeared after inside, assigned class=%s", track_id, best_cls)
 
 
 def load_yaml_config(path: str = "config.yaml") -> dict:
@@ -571,6 +596,9 @@ def build_and_run() -> None:
     app = QtWidgets.QApplication.instance()
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
+
+    if _DEBUG:
+        logging.basicConfig(level=logging.DEBUG, format="%(name)s: %(message)s")
 
     cfg = load_yaml_config()
 

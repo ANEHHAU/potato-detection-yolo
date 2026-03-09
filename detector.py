@@ -123,6 +123,8 @@ class PotatoDetector:
 
         for r in results:
             boxes = r.boxes
+            if boxes is None or len(boxes) == 0:
+                continue
             if boxes.id is None:
                 continue
 

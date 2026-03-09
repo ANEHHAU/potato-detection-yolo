@@ -233,9 +233,12 @@ class MainWindow(QtWidgets.QMainWindow):
     # ----- UI Construction -----
 
     def _build_layout(self) -> None:
-        central = QtWidgets.QWidget()
-        self.setCentralWidget(central)
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
 
+        central = QtWidgets.QWidget()
         main_layout = QtWidgets.QVBoxLayout(central)
 
         # Video feed (top: original, bottom: processed / interactive)
@@ -345,6 +348,9 @@ class MainWindow(QtWidgets.QMainWindow):
         sliders_layout.addRow("Detection confidence", self.detection_conf_slider)
 
         main_layout.addLayout(sliders_layout)
+
+        scroll_area.setWidget(central)
+        self.setCentralWidget(scroll_area)
 
         # Connect signals
         self.start_btn.clicked.connect(self.start_requested.emit)

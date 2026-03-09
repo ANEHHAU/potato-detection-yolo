@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Set, Tuple
 
 from detector import DetectionResult
+
+_counter_logger = logging.getLogger("potato_counter")
 
 
 class CountingMode(str, Enum):
@@ -105,6 +108,18 @@ class ObjectCounter:
 
             # Only count if track_id is in countable_ids (has confirmed class)
             if countable_ids is not None and track_id not in countable_ids:
+                px, py = history[-2]
+                cx2, cy2 = history[-1]
+                crossed = (
+                    self.mode == CountingMode.LINE_CROSSING
+                    and self.line_config
+                    and self._check_line_cross(px, py, cx2, cy2, self.line_config)
+                )
+                if crossed:
+                    _counter_logger.debug(
+                        "Object id=%d crosses COUNT line but has no confirmed class (ignore)",
+                        track_id,
+                    )
                 self.last_positions[track_id] = (cx, cy)
                 continue
 
@@ -153,14 +168,17 @@ class ObjectCounter:
         cfg: LineCountingConfig,
     ) -> bool:
         """
-        Check if movement segment (prev -> curr) crosses a (mostly) horizontal
-        counting line using center Y-coordinates as in the specification.
+        Check if movement segment (prev -> curr) crosses the counting line
+        using center Y-coordinates. Supports both directions.
         """
-        # Use the average Y of the line endpoints as reference
         y_line = (cfg.y1 + cfg.y2) / 2.0
-
-        # Crossing from above to below (or exactly on the line)
-        return prev_y < y_line <= curr_y
+        # Crossing from above to below (downward)
+        if prev_y < y_line <= curr_y:
+            return True
+        # Crossing from below to above (upward)
+        if curr_y < y_line <= prev_y:
+            return True
+        return False
 
     @staticmethod
     def _inside_zone(x: int, y: int, cfg: ZoneCountingConfig) -> bool:
