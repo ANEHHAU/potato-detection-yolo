@@ -1,0 +1,49 @@
+video:
+  # Camera source:
+  # - 0,1,... for USB cameras
+  # - "rtsp://ip" for IP cameras
+  # - "test.mp4" for video file
+  source: 0
+  width: null
+  height: null
+  fps: null
+
+model:
+  path: best2.pt
+  device: ""  # "cuda" or "cpu" or ""
+
+preprocessing:
+  resize_width: 640
+  resize_height: 640
+  use_gaussian_blur: true
+  use_median_blur: false
+  blur_kernel_size: 5
+  use_clahe: true
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: [8, 8]
+  brightness: 1.0
+  contrast: 0.0
+
+detection:
+  confidence_threshold: 0.4
+  iou_threshold: 0.5
+
+counting:
+  # mode: "line" | "zone" | "direction"
+  mode: "line"
+  line_y: 320
+  zone:
+    x1: 0
+    y1: 0
+    x2: 640
+    y2: 640
+  direction_x_ref: 320
+
+database:
+  backend: "sqlite"
+  sqlite_path: "potato_qc.db"
+  snapshot_dir: "snapshots"
+
+ui:
+  defect_alarm_threshold: 10.0
+
