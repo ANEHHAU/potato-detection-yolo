@@ -59,8 +59,9 @@ class ObjectCounter:
 
         # track_id -> last center position
         self.last_positions: Dict[int, Tuple[int, int]] = {}
-        # track_id -> full history of centers (prev, curr, ...)
+        # track_id -> history of centers (capped at TRACK_HISTORY_MAX to prevent memory growth)
         self.track_history: Dict[int, List[Tuple[int, int]]] = {}
+        self.track_history_max: int = 5
         # track_id -> has been counted
         self.counted_ids: Dict[int, bool] = {}
 
@@ -93,9 +94,11 @@ class ObjectCounter:
 
             track_id = det.track_id
             cx, cy = det.center
-            # Maintain explicit center history per ID
+            # Maintain center history per ID; keep only last N positions
             history = self.track_history.setdefault(track_id, [])
             history.append((cx, cy))
+            if len(history) > self.track_history_max:
+                history[:] = history[-self.track_history_max :]
 
             # Need at least two positions to check a crossing
             if len(history) < 2:
@@ -103,33 +106,44 @@ class ObjectCounter:
                 continue
 
             if self.counted_ids.get(track_id, False):
+                # Already counted — skip silently
                 self.last_positions[track_id] = (cx, cy)
                 continue
 
-            # Only count if track_id is in countable_ids (has confirmed class)
+            # Only count if track_id is in countable_ids (has confirmed final class)
             if countable_ids is not None and track_id not in countable_ids:
-                px, py = history[-2]
-                cx2, cy2 = history[-1]
-                crossed = (
+                # Object has not yet exited the DEFINE ZONE — check if it crossed
+                # the line anyway so we can log the miss for debugging.
+                prev_x2, prev_y2 = history[-2]
+                curr_x2, curr_y2 = history[-1]
+                if (
                     self.mode == CountingMode.LINE_CROSSING
                     and self.line_config
-                    and self._check_line_cross(px, py, cx2, cy2, self.line_config)
-                )
-                if crossed:
+                    and self._check_line_cross(prev_x2, prev_y2, curr_x2, curr_y2, self.line_config)
+                ):
                     _counter_logger.debug(
-                        "Object id=%d crosses COUNT line but has no confirmed class (ignore)",
+                        "[COUNT LINE] id=%d crossed line but has NO confirmed class yet \u2014 not counted",
                         track_id,
                     )
                 self.last_positions[track_id] = (cx, cy)
                 continue
 
-            # Previous vs current center positions
+            # ---- Object is countable AND not yet counted ----
             prev_x, prev_y = history[-2]
             curr_x, curr_y = history[-1]
 
             if self.mode == CountingMode.LINE_CROSSING and self.line_config:
                 if self._check_line_cross(prev_x, prev_y, curr_x, curr_y, self.line_config):
+                    _counter_logger.debug(
+                        "[COUNT LINE CROSSED] id=%d crossed COUNT LINE \u2014 incrementing counter (total will be %d)",
+                        track_id, self.total_count + 1,
+                    )
                     self._mark_counted(track_id)
+                else:
+                    _counter_logger.debug(
+                        "[COUNT LINE] id=%d is countable, prev=(%d,%d) curr=(%d,%d) \u2014 no crossing yet",
+                        track_id, prev_x, prev_y, curr_x, curr_y,
+                    )
 
             elif self.mode == CountingMode.ZONE and self.zone_config:
                 if self._check_zone_transition(prev_x, prev_y, curr_x, curr_y, self.zone_config):
@@ -168,16 +182,48 @@ class ObjectCounter:
         cfg: LineCountingConfig,
     ) -> bool:
         """
-        Check if movement segment (prev -> curr) crosses the counting line
-        using center Y-coordinates. Supports both directions.
+        True if the movement segment (prev→curr) crosses the count line segment
+        (cfg.x1,cfg.y1)→(cfg.x2,cfg.y2).
+
+        Uses the standard 2-D segment-intersection test based on cross-product
+        orientation so it works for horizontal, vertical, and diagonal count lines.
         """
-        y_line = (cfg.y1 + cfg.y2) / 2.0
-        # Crossing from above to below (downward)
-        if prev_y < y_line <= curr_y:
+        # Movement segment: A(prev) → B(curr)
+        ax, ay = prev_x, prev_y
+        bx, by = curr_x, curr_y
+        # Count line segment: C → D
+        cx, cy = cfg.x1, cfg.y1
+        dx, dy = cfg.x2, cfg.y2
+
+        def _cross(ox, oy, px, py, qx, qy) -> float:
+            """Signed cross product of vectors (OP × OQ)."""
+            return (px - ox) * (qy - oy) - (py - oy) * (qx - ox)
+
+        d1 = _cross(cx, cy, dx, dy, ax, ay)
+        d2 = _cross(cx, cy, dx, dy, bx, by)
+        d3 = _cross(ax, ay, bx, by, cx, cy)
+        d4 = _cross(ax, ay, bx, by, dx, dy)
+
+        if ((d1 > 0 and d2 < 0) or (d1 < 0 and d2 > 0)) and \
+           ((d3 > 0 and d4 < 0) or (d3 < 0 and d4 > 0)):
             return True
-        # Crossing from below to above (upward)
-        if curr_y < y_line <= prev_y:
+
+        # Collinear edge cases: check if endpoint lies on the other segment
+        def _on_seg(ox, oy, px, py, qx, qy) -> bool:
+            return (
+                min(ox, px) <= qx <= max(ox, px)
+                and min(oy, py) <= qy <= max(oy, py)
+            )
+
+        if d1 == 0 and _on_seg(cx, cy, dx, dy, ax, ay):
             return True
+        if d2 == 0 and _on_seg(cx, cy, dx, dy, bx, by):
+            return True
+        if d3 == 0 and _on_seg(ax, ay, bx, by, cx, cy):
+            return True
+        if d4 == 0 and _on_seg(ax, ay, bx, by, dx, dy):
+            return True
+
         return False
 
     @staticmethod

@@ -104,11 +104,16 @@ class FrameProcessor(QtCore.QObject):
         self._final_classes: Dict[int, str] = {}
         # Minimum number of observations inside Define Zone before fixing class
         self._min_define_zone_observations: int = 1
+        # Maximum predictions kept per track_id in zone history (prevents memory growth)
+        self._max_zone_history: int = 20
 
         # Tracking lifetime for filtering out very short-lived false positives
         self._track_total_frames: Dict[int, int] = {}
         self._define_zone_inside: Dict[int, bool] = {}
         self._min_frames_for_class: int = 1
+
+        # Track which IDs have been logged as entering ROI (for debug once-per-entry logging)
+        self._roi_logged_ids: set = set()
 
     def start(self) -> None:
         if self._running:
@@ -195,6 +200,7 @@ class FrameProcessor(QtCore.QObject):
         self._final_classes.clear()
         self._track_total_frames.clear()
         self._define_zone_inside.clear()
+        self._roi_logged_ids.clear()
         self._frame_index = 0
         self._paused = False
         self._at_end = False
@@ -260,95 +266,174 @@ class FrameProcessor(QtCore.QObject):
                 self.stop()
                 return
         self._frame_index += 1
-        # Preprocessing (resize, denoise, contrast, ROI)
+        # Preprocessing (resize, denoise, contrast)
         base_frame = self.preprocessor.apply(frame)
 
-        # If ROI is defined, zero out everything outside ROI before detection so
-        # detections and tracking IDs are created only inside ROI.
+        # ── STAGE 1: DETECT ─────────────────────────────────────────────────────
+        # Pixel-mask the frame to the ROI area when one is defined.  This improves
+        # detection quality inside the conveyor zone but does NOT restrict which
+        # detections survive — that is handled by the ROI filter in Stage 8.
         if self.roi_polygon and len(self.roi_polygon) >= 3:
             roi_mask = self._build_roi_mask(base_frame.shape[:2])
             detect_frame = cv2.bitwise_and(base_frame, base_frame, mask=roi_mask)
         else:
             detect_frame = base_frame
 
-        # Detection + tracking (ByteTrack via Ultralytics) on ROI-restricted frame
-        detections = self.detector.track(detect_frame)
-        if _DEBUG and detections:
-            for d in detections:
-                if d.track_id is None:
-                    logger.error("Pipeline: detection exists but no track_id (frame %d)", self._frame_index)
+        # ── STAGE 2: TRACK (ByteTrack, persist=True) ────────────────────────────
+        # Always runs — tracking must not be gated behind any user-drawn zone.
+        raw_results = self.detector.track(detect_frame, persist=True)
+        if _DEBUG:
+            logger.debug(
+                "[DETECT OK][TRACKING OK] frame=%d raw=%d",
+                self._frame_index, len(raw_results),
+            )
 
-        # Restrict detections to ROI region (safety filter)
-        before_roi = len(detections)
-        detections = self._filter_by_polygon(detections, self.roi_polygon)
-        if _DEBUG and before_roi != len(detections):
-            logger.debug("ROI filter: %d -> %d detections", before_roi, len(detections))
+        # ── STAGE 3: VALIDITY FILTER ─────────────────────────────────────────────
+        # Drop detections that have no track_id, a degenerate bbox, or a center
+        # that cannot be computed.  All survivors go into all_detections.
+        all_detections = []
+        for d in raw_results:
+            if d.track_id is None:
+                if _DEBUG:
+                    logger.debug("[SKIP] no track_id frame=%d", self._frame_index)
+                continue
+            if d.x2 <= d.x1 or d.y2 <= d.y1:
+                if _DEBUG:
+                    logger.debug("[SKIP] bad bbox id=%s frame=%d", d.track_id, self._frame_index)
+                continue
+            try:
+                _ = d.center
+            except Exception:
+                if _DEBUG:
+                    logger.debug("[SKIP] center error id=%s frame=%d", d.track_id, self._frame_index)
+                continue
+            all_detections.append(d)
 
-        # Suppress overlapping multi-class detections (keep highest confidence only)
-        detections = self._suppress_overlaps(detections, iou_threshold=0.5)
+        # ── STAGE 4: OVERLAP SUPPRESSION (NMS across all classes) ───────────────
+        all_detections = self._suppress_overlaps(all_detections, iou_threshold=0.5)
 
-        # Classification stabilization (temporal smoothing)
-        detections = self.stabilizer.update(detections)
+        # ── STAGE 5: CAPTURE RAW CLASS MAP (before stabilizer mutates labels) ───
+        # Snapshot the unmodified YOLO class+confidence per track_id so the
+        # DEFINE ZONE history stores per-frame model output, not smoothed labels.
+        raw_class_map: Dict[int, tuple[str, float]] = {
+            d.track_id: (d.cls_name, float(d.confidence))
+            for d in all_detections
+            if d.track_id is not None
+        }
 
-        # Update Define Zone-based final class assignments
-        self._update_define_zone_classes(detections)
+        # ── STAGE 6: CLASSIFICATION STABILIZER (temporal majority-vote) ─────────
+        # Overwrites det.cls_name with the rolling-window majority class per ID.
+        all_detections = self.stabilizer.update(all_detections)
 
-        # Counting logic: only count objects that have confirmed class from Define Zone
+        # ── STAGE 7: BACKGROUND REMOVAL ──────────────────────────────────────────
+        # Builds a mask from every tracked bbox in all_detections so potato pixels
+        # are preserved and the background becomes white.  Runs unconditionally —
+        # ROI membership is irrelevant for background removal.
+        processed = base_frame.copy()
+        if self.remove_background and all_detections:
+            h, w = base_frame.shape[:2]
+            potato_mask = np.zeros((h, w), dtype=np.uint8)
+            for det in all_detections:
+                x1 = max(0, det.x1)
+                y1 = max(0, det.y1)
+                x2 = min(w, det.x2)
+                y2 = min(h, det.y2)
+                if x2 > x1 and y2 > y1:
+                    potato_mask[y1:y2, x1:x2] = 255
+            processed[potato_mask == 0] = [255, 255, 255]
+            if _DEBUG:
+                logger.debug(
+                    "[BACKGROUND REMOVAL OK] frame=%d objects=%d",
+                    self._frame_index, len(all_detections),
+                )
+
+        # ── STAGE 8: ROI FILTER → roi_detections ────────────────────────────────
+        # Only objects whose centre lies inside the ROI polygon go forward to the
+        # DEFINE ZONE and COUNT LINE stages.
+        #
+        # When ROI is not yet defined:
+        #   roi_detections = []  →  zone and counter are idle.
+        #   all_detections still drives visualization, stabilizer, and BG removal
+        #   so tracking IDs and bounding boxes are always visible on screen.
+        #
+        # This is the ONLY place where ROI membership is enforced.
+        if self.roi_polygon and len(self.roi_polygon) >= 3:
+            roi_detections = self._filter_by_polygon(all_detections, self.roi_polygon)
+            if _DEBUG:
+                for d in roi_detections:
+                    if d.track_id not in self._roi_logged_ids:
+                        self._roi_logged_ids.add(d.track_id)
+                        logger.debug(
+                            "[ROI ENTRY] id=%d first entry frame=%d center=%s",
+                            d.track_id, self._frame_index, d.center,
+                        )
+                logger.debug(
+                    "[ROI FILTER OK] frame=%d all=%d roi=%d",
+                    self._frame_index, len(all_detections), len(roi_detections),
+                )
+        else:
+            roi_detections = []
+            if _DEBUG and all_detections:
+                logger.debug(
+                    "[ROI FILTER] no ROI defined — %d object(s) tracked/visible "
+                    "but NOT eligible for DEFINE ZONE or counting (frame=%d)",
+                    len(all_detections), self._frame_index,
+                )
+
+        # ── STAGE 9: DEFINE ZONE ─────────────────────────────────────────────────
+        # Collect (class_name, confidence) while an ROI object is inside the zone.
+        # Finalise the class when the object exits (or disappears while inside).
+        # Operates exclusively on roi_detections.
+        self._update_define_zone_classes(roi_detections, raw_class_map)
+
+        # countable_ids = track_ids that have a confirmed final class from DEFINE ZONE
         countable_ids = set(self._final_classes.keys())
+
+        # ── STAGE 10: COUNT LINE ─────────────────────────────────────────────────
+        # Increments only for objects in countable_ids that cross the count line
+        # and have not already been counted.  Operates on roi_detections.
         prev_total = self.counter.total_count
-        new_total = self.counter.update(detections, countable_ids=countable_ids)
+        new_total = self.counter.update(roi_detections, countable_ids=countable_ids)
 
         if _DEBUG and self.counter.newly_counted_ids:
             for tid in self.counter.newly_counted_ids:
                 cls_val = self._final_classes.get(tid, "?")
-                logger.debug("Counted id=%d class=%s total=%d", tid, cls_val, new_total)
+                logger.debug(
+                    "[COUNT LINE CROSSED][COUNTER INCREMENTED] id=%d class=%s total=%d frame=%d",
+                    tid, cls_val, new_total, self._frame_index,
+                )
 
-        # Update statistics and DB only for newly counted track IDs,
-        # and only once a final class from Define Zone is available.
+        # ── STAGE 11: STATISTICS & DATABASE (newly counted objects only) ─────────
         if new_total > prev_total and self.counter.newly_counted_ids:
             for track_id in self.counter.newly_counted_ids:
                 if track_id not in self._final_classes:
-                    # Skip objects that never passed through Define Zone
                     continue
-                # Find the latest detection for this track in current frame
-                latest_det = None
-                for det in reversed(detections):
-                    if det.track_id == track_id:
-                        latest_det = det
-                        break
+                latest_det = next(
+                    (d for d in reversed(roi_detections) if d.track_id == track_id),
+                    None,
+                )
                 if latest_det is None:
                     continue
-                # Use the confirmed final class for statistics and logging
                 latest_det.cls_name = self._final_classes[track_id]
                 self.stats_manager.update_from_detection(latest_det)
                 self.db.log_event(latest_det, base_frame, save_snapshot=True)
 
-        # Build visualization frame with background removed (when enabled)
-        processed = base_frame.copy()
-        if self.remove_background and detections:
-            # Keep original potato pixels unchanged; set only background to white.
-            h, w = base_frame.shape[:2]
-            potato_mask = np.zeros((h, w), dtype=np.uint8)
-            for det in detections:
-                x1, y1, x2, y2 = det.x1, det.y1, det.x2, det.y2
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                potato_mask[y1:y2, x1:x2] = 255
-            processed[potato_mask == 0] = [255, 255, 255]
+        # ── STAGE 12: VISUALIZE ──────────────────────────────────────────────────
+        # Draw on processed using ALL detections so every tracked object gets a
+        # bounding box and track ID, regardless of ROI membership.
+        # Confirmed class labels come from _final_classes and appear only after
+        # the object has exited the DEFINE ZONE.
+        self._draw_overlays(processed, all_detections)
 
-        # Draw overlays for visualization (ROI, Define Zone, line, boxes, etc.)
-        self._draw_overlays(processed, detections)
-
-        # Emit frames (original + processed) and stats for UI
+        # Emit frames and stats to the UI
         self.frame_processed.emit(base_frame, processed, self.stats_manager.stats)
 
-        # Emit playback position for uploaded videos (timeline support)
+        # Timeline slider update for uploaded videos
         if self.video.is_file_source() and self.video.is_opened():
             current = self.video.get_frame_index()
             total = self.video.get_frame_count()
             self.position_updated.emit(current, total)
+
 
     def _point_in_polygon(self, poly: list[tuple[int, int]] | None, x: int, y: int) -> bool:
         if not poly or len(poly) < 3:
@@ -421,17 +506,22 @@ class FrameProcessor(QtCore.QObject):
                     cv2.LINE_AA,
                 )
 
-                # Show class label only after Define Zone has confirmed it
+                # Class label display rule (strict pipeline):
+                # ONLY show class label when a FINAL CLASS has been confirmed.
+                # Final class is only assigned AFTER the object exits the DEFINE ZONE.
+                # While inside DEFINE ZONE or before entering it: show track ID only.
+                # When no DEFINE ZONE is configured: _final_classes is always empty,
+                # so nothing is shown (users must configure DEFINE ZONE first).
                 if det.track_id in self._final_classes:
-                    class_text = f"Class: {self._final_classes[det.track_id]}"
+                    class_text = self._final_classes[det.track_id]
                     cv2.putText(
                         frame,
                         class_text,
                         (det.x1, max(0, det.y1 - 30)),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 255, 0),
-                        1,
+                        0.55,
+                        (0, 255, 255),  # Bright yellow — confirmed final class
+                        2,
                         cv2.LINE_AA,
                     )
 
@@ -479,13 +569,23 @@ class FrameProcessor(QtCore.QObject):
 
         return kept
 
-    def _update_define_zone_classes(self, detections) -> None:
+    def _update_define_zone_classes(
+        self,
+        detections,
+        raw_class_map: Dict[int, tuple[str, float]] | None = None,
+    ) -> None:
         """
         Aggregate class predictions for each track while it passes through the
         Define Zone polygon, and assign a stable final class per track based on
         average confidence. Once assigned, the class remains fixed.
+
+        raw_class_map: optional dict of track_id -> (raw_cls_name, raw_confidence)
+            extracted directly from YOLO output BEFORE the stabilizer overwrites
+            cls_name. When provided, we prefer this over det.cls_name so the zone
+            history reflects the actual per-frame model output.
         """
         if not self.define_zone_polygon or len(self.define_zone_polygon) < 3:
+            # No Define Zone configured: do nothing (objects count without zone)
             return
 
         # Update lifetime for all tracks seen in this frame
@@ -504,84 +604,126 @@ class FrameProcessor(QtCore.QObject):
 
             track_id = det.track_id
             current_ids.add(track_id)
-            if track_id in self._final_classes:
-                # Class already fixed – do not change it
-                continue
 
             cx, cy = det.center
             inside = self._point_in_polygon(self.define_zone_polygon, cx, cy)
             was_inside = self._define_zone_inside.get(track_id, False)
 
-            # Accumulate history while inside Define Zone
+            # Skip further accumulation if final class already decided for this track
+            if track_id in self._final_classes:
+                # Update inside flag and continue — no further work needed
+                self._define_zone_inside[track_id] = inside
+                continue
+
+            # ----- COLLECT predictions while object is inside DEFINE ZONE -----
+            # DO NOT display or assign any class here.
+            # Only accumulate (class_name, confidence) into history.
             if inside:
-                cls_name = det.cls_name
-                conf = float(det.confidence)
+                # Use raw YOLO output (before stabilizer) so the history reflects
+                # the actual per-frame model prediction, not the smoothed class.
+                if raw_class_map and track_id in raw_class_map:
+                    cls_name, conf = raw_class_map[track_id]
+                else:
+                    cls_name = det.cls_name
+                    conf = float(det.confidence)
+
                 history = self._id_class_history.setdefault(track_id, [])
                 history.append((cls_name, conf))
-                if _DEBUG and len(history) == 1:
-                    logger.debug("DEFINE zone: id=%d entered, first prediction %s %.2f", track_id, cls_name, conf)
 
-            # Detect transition: leaving Define Zone
+                # Cap history size to prevent memory growth (keep most recent 20 frames)
+                if len(history) > self._max_zone_history:
+                    self._id_class_history[track_id] = history[-self._max_zone_history:]
+                    history = self._id_class_history[track_id]
+
+                if _DEBUG:
+                    if len(history) == 1:
+                        logger.debug(
+                            "DEFINE zone: id=%d ENTERED zone at frame %d — "
+                            "collecting predictions (first: %s %.2f)",
+                            track_id, self._frame_index, cls_name, conf,
+                        )
+                    else:
+                        logger.debug(
+                            "DEFINE zone: collecting id=%d frame=%d class=%s conf=%.2f n=%d",
+                            track_id, self._frame_index, cls_name, conf, len(history),
+                        )
+
+            # ----- FINALIZE when object transitions from inside → outside zone -----
+            # This is the ONLY place final class is assigned.
             if was_inside and not inside:
-                history = self._id_class_history.get(track_id, [])
-                total_obs = len(history)
-
-                if total_obs >= self._min_define_zone_observations:
-                    # Group by class and compute average confidence
-                    class_sums: Dict[str, float] = {}
-                    class_counts: Dict[str, int] = {}
-                    for name, conf in history:
-                        class_sums[name] = class_sums.get(name, 0.0) + conf
-                        class_counts[name] = class_counts.get(name, 0) + 1
-
-                    best_cls = None
-                    best_conf = -1.0
-                    for name, total_conf in class_sums.items():
-                        avg_conf = float(total_conf / max(1, class_counts[name]))
-                        if avg_conf > best_conf:
-                            best_conf = avg_conf
-                            best_cls = name
-
-                    if best_cls is not None:
-                        self._final_classes[track_id] = best_cls
-                        if _DEBUG:
-                            logger.debug("DEFINE zone: id=%d exited, assigned final class=%s", track_id, best_cls)
-                    elif _DEBUG:
-                        logger.warning("DEFINE zone: id=%d exited but no class assigned (history len=%d)", track_id, total_obs)
+                logger.debug(
+                    "DEFINE zone: id=%d LEFT zone at frame %d — finalizing class",
+                    track_id, self._frame_index,
+                ) if _DEBUG else None
+                self._finalize_class_from_history(track_id, reason="exited")
 
             # Update inside-flag for next frame
             self._define_zone_inside[track_id] = inside
 
-        # Handle tracks that were inside the Define Zone but disappeared
-        # from the current frame (e.g., left the frame or became undetected)
+        # ----- Handle tracks that disappeared while inside Define Zone -----
+        # (e.g., tracking lost, object left frame without exiting zone cleanly)
         for track_id, was_inside in list(self._define_zone_inside.items()):
             if not was_inside or track_id in current_ids:
                 continue
             if track_id in self._final_classes:
                 continue
+            # Track disappeared while inside zone — finalize its class from collected history
+            if _DEBUG:
+                logger.debug(
+                    "DEFINE zone: id=%d DISAPPEARED inside zone (frame %d) — finalizing class",
+                    track_id, self._frame_index,
+                )
+            self._finalize_class_from_history(track_id, reason="disappeared")
 
-            history = self._id_class_history.get(track_id, [])
-            total_obs = len(history)
+    def _finalize_class_from_history(self, track_id: int, reason: str = "exited") -> None:
+        """
+        Compute the final class for a track_id from its accumulated zone history
+        using average confidence per class. Stores result in self._final_classes.
+        """
+        history = self._id_class_history.get(track_id, [])
+        total_obs = len(history)
 
-            if total_obs >= self._min_define_zone_observations:
-                class_sums: Dict[str, float] = {}
-                class_counts: Dict[str, int] = {}
-                for name, conf in history:
-                    class_sums[name] = class_sums.get(name, 0.0) + conf
-                    class_counts[name] = class_counts.get(name, 0) + 1
+        if total_obs < self._min_define_zone_observations:
+            if _DEBUG:
+                logger.warning(
+                    "DEFINE zone: id=%d %s but not enough observations (%d < %d), skip",
+                    track_id, reason, total_obs, self._min_define_zone_observations,
+                )
+            return
 
-                best_cls = None
-                best_conf = -1.0
-                for name, total_conf in class_sums.items():
-                    avg_conf = float(total_conf / max(1, class_counts[name]))
-                    if avg_conf > best_conf:
-                        best_conf = avg_conf
-                        best_cls = name
+        # Compute average confidence per class
+        class_sums: Dict[str, float] = {}
+        class_counts: Dict[str, int] = {}
+        for name, conf in history:
+            class_sums[name] = class_sums.get(name, 0.0) + conf
+            class_counts[name] = class_counts.get(name, 0) + 1
 
-                if best_cls is not None:
-                    self._final_classes[track_id] = best_cls
-                    if _DEBUG:
-                        logger.debug("DEFINE zone: id=%d disappeared after inside, assigned class=%s", track_id, best_cls)
+        best_cls: str | None = None
+        best_avg_conf: float = -1.0
+        for name, total_conf in class_sums.items():
+            avg_conf = float(total_conf / max(1, class_counts[name]))
+            if _DEBUG:
+                logger.debug(
+                    "DEFINE zone: id=%d class=%s avg_conf=%.3f (n=%d)",
+                    track_id, name, avg_conf, class_counts[name],
+                )
+            if avg_conf > best_avg_conf:
+                best_avg_conf = avg_conf
+                best_cls = name
+
+        if best_cls is not None:
+            self._final_classes[track_id] = best_cls
+            if _DEBUG:
+                logger.debug(
+                    "DEFINE zone: id=%d %s → final class='%s' (avg_conf=%.3f, %d obs); "
+                    "track_id ADDED to countable_ids",
+                    track_id, reason, best_cls, best_avg_conf, total_obs,
+                )
+        elif _DEBUG:
+            logger.warning(
+                "DEFINE zone: id=%d %s but no class could be selected (history len=%d)",
+                track_id, reason, total_obs,
+            )
 
 
 def load_yaml_config(path: str = "config.yaml") -> dict:

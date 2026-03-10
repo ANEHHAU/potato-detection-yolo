@@ -59,19 +59,20 @@ class ClassificationStabilizer:
                 if len(state.conf_history) > self.history_size:
                     state.conf_history.pop(0)
 
-            # Apply stabilization to this detection with sticky class assignment
+            # Apply stabilization: update stable_class every frame using the
+            # current rolling-window majority class. This prevents early-freeze
+            # where the very first detection permanently locks the class label.
             state = self.tracks[track_id]
             majority_cls = self._majority_class(state.class_history)
             avg_conf = self._average_confidence(state.conf_history)
 
-            if state.stable_class is None:
-                # First few frames: choose initial stable class
-                state.stable_class = majority_cls
-                state.stable_confidence = avg_conf
+            # Always update to reflect the current best majority class
+            state.stable_class = majority_cls
+            state.stable_confidence = avg_conf
 
-            # Keep using the stable class to avoid label flipping
+            # Overwrite detection label with the temporally stabilized class
             det.cls_name = state.stable_class
-            det.confidence = max(det.confidence, state.stable_confidence)
+            det.confidence = avg_conf if avg_conf > 0 else det.confidence
 
         return detections
 

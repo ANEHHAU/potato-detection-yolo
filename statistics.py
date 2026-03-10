@@ -34,13 +34,29 @@ class StatisticsManager:
     def reset(self) -> None:
         self.stats = PotatoStats()
 
+    # Canonical class name mapping for consistent statistics (handles model variants)
+    _CLASS_NORMALIZE: Dict[str, str] = {
+        "potato": "Potato",
+        "defected potato": "Defected potato",
+        "damaged potato": "Damaged potato",
+        "diseased-fungal potato": "Diseased-fungal potato",
+        "sprouted potato": "Sprouted potato",
+    }
+
+    def _normalize_class(self, cls_name: str) -> str:
+        if not cls_name:
+            return ""
+        key = cls_name.strip().lower()
+        return self._CLASS_NORMALIZE.get(key, cls_name)
+
     def update_from_detection(self, det: DetectionResult) -> None:
         """
         Update aggregates based on a single (already-counted) potato.
+        Class names are normalized for consistent mapping.
         """
         self.stats.total += 1
 
-        cls = det.cls_name
+        cls = self._normalize_class(det.cls_name)
         if cls == "Potato":
             self.stats.good += 1
         elif cls == "Defected potato":

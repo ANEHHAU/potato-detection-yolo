@@ -127,8 +127,11 @@ class PotatoDetector:
                 continue
             if boxes.id is None:
                 continue
+            ids = boxes.id
+            if len(ids) != len(boxes):
+                continue
 
-            for box, track_id in zip(boxes, boxes.id):
+            for box, track_id in zip(boxes, ids):
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 cls_id = int(box.cls[0])
                 conf = float(box.conf[0])
