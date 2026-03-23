@@ -57,6 +57,7 @@ class FrameProcessor(QtCore.QObject):
         line_config: LineCountingConfig | None,
         zone_config: ZoneCountingConfig | None,
         direction_config: DirectionCountingConfig | None,
+        operating_mode: int = 1,
         parent: Optional[QtCore.QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -84,6 +85,7 @@ class FrameProcessor(QtCore.QObject):
         )
         self.stats_manager = StatisticsManager()
         self.db = EventLogger(db_config)
+        self.operating_mode = operating_mode
 
         self._running = False
         self._paused: bool = False
@@ -93,15 +95,17 @@ class FrameProcessor(QtCore.QObject):
         self.define_zone_polygon: list[tuple[int, int]] | None = None
         self.remove_background: bool = False
 
-        # Background subtraction for foreground-only visualization / detection
-        self._bg_subtractor = cv2.createBackgroundSubtractorMOG2(
-            history=500, varThreshold=25, detectShadows=False
-        )
+        # Tracking Fail-Safe buffer
+        self._lost_tracks: Dict[int, tuple[object, int]] = {}
+        self._max_lost_frames: int = 3
+        
+        self.box_margin: int = 10
 
         # Define Zone classification aggregation: track_id -> list of (class_name, confidence)
         self._id_class_history: Dict[int, List[tuple[str, float]]] = {}
         # Final, stable class per track once decided in Define Zone
         self._final_classes: Dict[int, str] = {}
+        self._final_confidences: Dict[int, float] = {}
         # Minimum number of observations inside Define Zone before fixing class
         self._min_define_zone_observations: int = 1
         # Maximum predictions kept per track_id in zone history (prevents memory growth)
@@ -110,6 +114,7 @@ class FrameProcessor(QtCore.QObject):
         # Tracking lifetime for filtering out very short-lived false positives
         self._track_total_frames: Dict[int, int] = {}
         self._define_zone_inside: Dict[int, bool] = {}
+        self._pending_quality_stats: set[int] = set()
         self._min_frames_for_class: int = 1
 
         # Track which IDs have been logged as entering ROI (for debug once-per-entry logging)
@@ -195,15 +200,8 @@ class FrameProcessor(QtCore.QObject):
             iou_threshold=self._det_iou,
             device=self._model_device,
         )
-        # Reset Define Zone and tracking lifetime state
-        self._id_class_history.clear()
-        self._final_classes.clear()
-        self._track_total_frames.clear()
-        self._define_zone_inside.clear()
-        self._roi_logged_ids.clear()
-        self._frame_index = 0
-        self._paused = False
-        self._at_end = False
+        self._lost_tracks.clear()
+        self._pending_quality_stats.clear()
 
     def preview_first_frame(self) -> None:
         """
@@ -232,12 +230,7 @@ class FrameProcessor(QtCore.QObject):
 
         base_frame = self.preprocessor.apply(frame)
 
-        processed = base_frame
-        if self.remove_background:
-            fg_mask = self._bg_subtractor.apply(base_frame)
-            _, fg_mask = cv2.threshold(fg_mask, 127, 255, cv2.THRESH_BINARY)
-            fg_mask = cv2.medianBlur(fg_mask, 5)
-            processed = cv2.bitwise_and(base_frame, base_frame, mask=fg_mask)
+        processed = base_frame.copy()
 
         # Draw static overlays (ROI / Define Zone / counting line) on processed frame
         self._draw_overlays(processed, [])
@@ -308,9 +301,35 @@ class FrameProcessor(QtCore.QObject):
                     logger.debug("[SKIP] center error id=%s frame=%d", d.track_id, self._frame_index)
                 continue
             all_detections.append(d)
+            self._lost_tracks[d.track_id] = (d, 0)
+            
+        current_ids = {d.track_id for d in all_detections}
+        
+        # ── STAGE 3.5: TRACKING FAIL-SAFE ────────────────────────────────────────
+        # Inject missing tracks from previous frames to maintain continuity
+        for tid, (det, missed_frames) in list(self._lost_tracks.items()):
+            if tid not in current_ids:
+                if missed_frames < self._max_lost_frames:
+                    self._lost_tracks[tid] = (det, missed_frames + 1)
+                    all_detections.append(det)
+                else:
+                    self._lost_tracks.pop(tid, None)
 
         # ── STAGE 4: OVERLAP SUPPRESSION (NMS across all classes) ───────────────
         all_detections = self._suppress_overlaps(all_detections, iou_threshold=0.5)
+
+        # ── STAGE 4.5: END-OF-BELT PRUNING ───────────────────────────────────────
+        if self.roi_polygon and len(self.roi_polygon) >= 3:
+            pts = np.array(self.roi_polygon, dtype=np.int32)
+            filtered_detections = []
+            for d in all_detections:
+                dist = cv2.pointPolygonTest(pts, d.center, True)
+                # If negative, it is outside. If strictly less than -margin, it's totally out.
+                if dist >= -self.box_margin:
+                    filtered_detections.append(d)
+                else:
+                    self._lost_tracks.pop(d.track_id, None)
+            all_detections = filtered_detections
 
         # ── STAGE 5: CAPTURE RAW CLASS MAP (before stabilizer mutates labels) ───
         # Snapshot the unmodified YOLO class+confidence per track_id so the
@@ -325,98 +344,102 @@ class FrameProcessor(QtCore.QObject):
         # Overwrites det.cls_name with the rolling-window majority class per ID.
         all_detections = self.stabilizer.update(all_detections)
 
-        # ── STAGE 7: BACKGROUND REMOVAL ──────────────────────────────────────────
-        # Builds a mask from every tracked bbox in all_detections so potato pixels
-        # are preserved and the background becomes white.  Runs unconditionally —
-        # ROI membership is irrelevant for background removal.
+        # ── STAGE 7: VISUAL BACKGROUND REMOVAL ───────────────────────────────────
+        # Uses YOLO boxes to isolate potatoes against a white background
         processed = base_frame.copy()
-        if self.remove_background and all_detections:
+        if all_detections:
             h, w = base_frame.shape[:2]
             potato_mask = np.zeros((h, w), dtype=np.uint8)
+            gray = cv2.cvtColor(base_frame, cv2.COLOR_BGR2GRAY)
+            
             for det in all_detections:
                 x1 = max(0, det.x1)
                 y1 = max(0, det.y1)
                 x2 = min(w, det.x2)
                 y2 = min(h, det.y2)
-                if x2 > x1 and y2 > y1:
-                    potato_mask[y1:y2, x1:x2] = 255
+                
+                if x2 > x1 + 2 and y2 > y1 + 2:
+                    crop = gray[y1:y2, x1:x2]
+                    _, crop_mask = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    contours, _ = cv2.findContours(crop_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    if contours:
+                        c = max(contours, key=cv2.contourArea)
+                        rect = cv2.minAreaRect(c)
+                        center = (rect[0][0] + x1, rect[0][1] + y1)
+                        size = (rect[1][0] + 2 * self.box_margin, rect[1][1] + 2 * self.box_margin)
+                        expanded_rect = (center, size, rect[2])
+                        box = cv2.boxPoints(expanded_rect)
+                        det.rotated_box = np.array(box, dtype=np.int32)
+                    else:
+                        det.rotated_box = np.array([[x1 - self.box_margin, y1 - self.box_margin],
+                                                    [x2 + self.box_margin, y1 - self.box_margin],
+                                                    [x2 + self.box_margin, y2 + self.box_margin],
+                                                    [x1 - self.box_margin, y2 + self.box_margin]], dtype=np.int32)
+                else:
+                    det.rotated_box = np.array([[x1 - self.box_margin, y1 - self.box_margin],
+                                                [x2 + self.box_margin, y1 - self.box_margin],
+                                                [x2 + self.box_margin, y2 + self.box_margin],
+                                                [x1 - self.box_margin, y2 + self.box_margin]], dtype=np.int32)
+                
+                cv2.fillPoly(potato_mask, [det.rotated_box], 255)
+            
             processed[potato_mask == 0] = [255, 255, 255]
-            if _DEBUG:
-                logger.debug(
-                    "[BACKGROUND REMOVAL OK] frame=%d objects=%d",
-                    self._frame_index, len(all_detections),
-                )
 
         # ── STAGE 8: ROI FILTER → roi_detections ────────────────────────────────
-        # Only objects whose centre lies inside the ROI polygon go forward to the
-        # DEFINE ZONE and COUNT LINE stages.
-        #
-        # When ROI is not yet defined:
-        #   roi_detections = []  →  zone and counter are idle.
-        #   all_detections still drives visualization, stabilizer, and BG removal
-        #   so tracking IDs and bounding boxes are always visible on screen.
-        #
-        # This is the ONLY place where ROI membership is enforced.
-        if self.roi_polygon and len(self.roi_polygon) >= 3:
-            roi_detections = self._filter_by_polygon(all_detections, self.roi_polygon)
-            if _DEBUG:
-                for d in roi_detections:
-                    if d.track_id not in self._roi_logged_ids:
-                        self._roi_logged_ids.add(d.track_id)
-                        logger.debug(
-                            "[ROI ENTRY] id=%d first entry frame=%d center=%s",
-                            d.track_id, self._frame_index, d.center,
-                        )
-                logger.debug(
-                    "[ROI FILTER OK] frame=%d all=%d roi=%d",
-                    self._frame_index, len(all_detections), len(roi_detections),
-                )
+        roi_pts = self.roi_polygon
+        if roi_pts is not None and len(roi_pts) >= 3:
+            roi_detections = self._filter_by_polygon(all_detections, roi_pts)
         else:
-            roi_detections = []
-            if _DEBUG and all_detections:
-                logger.debug(
-                    "[ROI FILTER] no ROI defined — %d object(s) tracked/visible "
-                    "but NOT eligible for DEFINE ZONE or counting (frame=%d)",
-                    len(all_detections), self._frame_index,
-                )
+            roi_detections = all_detections
 
-        # ── STAGE 9: DEFINE ZONE ─────────────────────────────────────────────────
-        # Collect (class_name, confidence) while an ROI object is inside the zone.
-        # Finalise the class when the object exits (or disappears while inside).
-        # Operates exclusively on roi_detections.
-        self._update_define_zone_classes(roi_detections, raw_class_map)
-
-        # countable_ids = track_ids that have a confirmed final class from DEFINE ZONE
-        countable_ids = set(self._final_classes.keys())
+        # ── STAGE 9: DEFINE ZONE & CLASS ASSIGNMENT ──────────────────────────────
+        dz_pts = self.define_zone_polygon
+        has_define_zone = bool(dz_pts is not None and len(dz_pts) >= 3)
+        
+        if has_define_zone:
+            # Stage 9.1: Data collection / exit-based finalization
+            self._update_define_zone_classes(roi_detections, raw_class_map)
+        else:
+            # Stage 9.2: No Define Zone — immediate finalization for new tracks
+            for det in roi_detections:
+                tid = det.track_id
+                if tid is not None and tid not in self._final_classes:
+                    raw_cls = getattr(det, "cls_name", "Unknown")
+                    if getattr(self, "operating_mode", 1) == 1:
+                        final_cls = "Good Potato" if raw_cls and str(raw_cls).lower() == "potato" else "Defective Potato"
+                    else:
+                        final_cls = self.detector.localized_names.get(raw_cls, raw_cls)
+                    self._final_classes[tid] = final_cls
+                    self._final_confidences[tid] = float(getattr(det, "confidence", 1.0))
+                    self._on_track_finalized(tid, final_cls)
 
         # ── STAGE 10: COUNT LINE ─────────────────────────────────────────────────
-        # Increments only for objects in countable_ids that cross the count line
-        # and have not already been counted.  Operates on roi_detections.
+        # Restore counting: Independent of class labels or ROI filtering for robustness
+        # Increments whenever any track crosses the count line.
         prev_total = self.counter.total_count
-        new_total = self.counter.update(roi_detections, countable_ids=countable_ids)
+        new_total = self.counter.update(all_detections, countable_ids=None)
 
-        if _DEBUG and self.counter.newly_counted_ids:
-            for tid in self.counter.newly_counted_ids:
-                cls_val = self._final_classes.get(tid, "?")
-                logger.debug(
-                    "[COUNT LINE CROSSED][COUNTER INCREMENTED] id=%d class=%s total=%d frame=%d",
-                    tid, cls_val, new_total, self._frame_index,
-                )
-
-        # ── STAGE 11: STATISTICS & DATABASE (newly counted objects only) ─────────
+        # ── STAGE 11: STATISTICS & DATABASE ──────────────────────────────────────
         if new_total > prev_total and self.counter.newly_counted_ids:
             for track_id in self.counter.newly_counted_ids:
-                if track_id not in self._final_classes:
-                    continue
-                latest_det = next(
-                    (d for d in reversed(roi_detections) if d.track_id == track_id),
-                    None,
-                )
-                if latest_det is None:
-                    continue
-                latest_det.cls_name = self._final_classes[track_id]
-                self.stats_manager.update_from_detection(latest_det)
-                self.db.log_event(latest_det, base_frame, save_snapshot=True)
+                # Increment total stats immediately
+                self.stats_manager.stats.total += 1
+                
+                # Check if we have a final class ready
+                if track_id in self._final_classes:
+                    final_cls = self._final_classes[track_id]
+                    self.stats_manager.add_quality_only(final_cls)
+                    
+                    # Log event to database
+                    latest_det = next((d for d in reversed(all_detections) if getattr(d, 'track_id', None) == track_id), None)
+                    if latest_det:
+                        latest_det.cls_name = final_cls
+                        self.db.log_event(latest_det, base_frame, save_snapshot=True)
+                else:
+                    # Increment N/A counter
+                    self.stats_manager.add_na_only()
+                    # Defer quality stats until finalized
+                    self._pending_quality_stats.add(track_id)
 
         # ── STAGE 12: VISUALIZE ──────────────────────────────────────────────────
         # Draw on processed using ALL detections so every tracked object gets a
@@ -466,6 +489,18 @@ class FrameProcessor(QtCore.QObject):
         cv2.fillPoly(mask, [pts], 255)
         return mask
 
+
+
+
+
+# fix
+
+
+
+
+
+
+
     def _draw_overlays(self, frame, detections) -> None:
         # Draw ROI polygon if defined (green)
         if self.roi_polygon and len(self.roi_polygon) >= 2:
@@ -490,40 +525,74 @@ class FrameProcessor(QtCore.QObject):
             cv2.line(frame, (cfg.x1, cfg.y1), (cfg.x2, cfg.y2), (0, 0, 255), 2)
 
         # Draw detections
+        h, w = frame.shape[:2]
         for det in detections:
-            cv2.rectangle(frame, (det.x1, det.y1), (det.x2, det.y2), (0, 255, 0), 2)
-            if det.track_id is not None:
-                # Always show tracking ID
-                id_text = f"ID: {det.track_id}"
-                cv2.putText(
-                    frame,
-                    id_text,
-                    (det.x1, max(0, det.y1 - 15)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 0),
-                    1,
-                    cv2.LINE_AA,
-                )
+            if hasattr(det, 'rotated_box'):
+                cv2.polylines(frame, [det.rotated_box], isClosed=True, color=(0, 255, 0), thickness=1)
+                text_x = max(0, det.rotated_box[:, 0].min())
+                text_y = max(0, det.rotated_box[:, 1].min())
+            else:
+                text_x = max(0, det.x1 - self.box_margin)
+                text_y = max(0, det.y1 - self.box_margin)
+                x2 = min(w, det.x2 + self.box_margin)
+                y2 = min(h, det.y2 + self.box_margin)
+                cv2.rectangle(frame, (text_x, text_y), (x2, y2), (0, 255, 0), 1)
 
-                # Class label display rule (strict pipeline):
-                # ONLY show class label when a FINAL CLASS has been confirmed.
-                # Final class is only assigned AFTER the object exits the DEFINE ZONE.
-                # While inside DEFINE ZONE or before entering it: show track ID only.
-                # When no DEFINE ZONE is configured: _final_classes is always empty,
-                # so nothing is shown (users must configure DEFINE ZONE first).
-                if det.track_id in self._final_classes:
-                    class_text = self._final_classes[det.track_id]
-                    cv2.putText(
-                        frame,
-                        class_text,
-                        (det.x1, max(0, det.y1 - 30)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55,
-                        (0, 255, 255),  # Bright yellow — confirmed final class
-                        2,
-                        cv2.LINE_AA,
-                    )
+            if det.track_id is not None:
+                # Class label display rule
+                class_text = ""
+                conf_text = ""
+                text_color = (200, 200, 200)  # Light gray
+                cx, cy = det.center
+                dz_poly = self.define_zone_polygon
+                
+                # Check Define Zone validity
+                is_zone_valid = dz_poly is not None and len(dz_poly) >= 3
+                
+                if not is_zone_valid:
+                    # Zone Invalid: ALWAYS N/A
+                    class_text = "N/A"
+                else:
+                    # Zone Valid: Check priorities
+                    if det.track_id in self._final_classes:
+                        # Priority 1: Final class (Yellow)
+                        final_cls = self._final_classes[det.track_id]
+                        conf_val = self._final_confidences.get(det.track_id, 0.0) * 100
+                        if getattr(self, "operating_mode", 1) == 1:
+                            class_text = final_cls
+                        else:
+                            class_text = self.detector.localized_names.get(final_cls, final_cls)
+                        conf_text = f"{conf_val:.0f}%"
+                        text_color = (0, 255, 255)
+                    elif self._point_in_polygon(dz_poly, cx, cy):
+                        # Priority 2: Inside Zone (Purple)
+                        class_text = "DEFINING"
+                        text_color = (255, 0, 255)
+                    else:
+                        # Priority 3: Fallback (Gray)
+                        class_text = "N/A"
+
+                # Safely stack lines to prevent out-of-screen rendering
+                base_y = max(35, text_y)
+
+                # Line 1: ID
+                cv2.putText(frame, f"ID: {det.track_id}", (text_x, base_y - 24),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, text_color, 1, cv2.LINE_AA)
+
+                # Line 2: Class
+                if class_text:
+                    size = 0.45
+                    cv2.putText(frame, class_text, (text_x, base_y - 12),
+                                cv2.FONT_HERSHEY_SIMPLEX, size, text_color, 1, cv2.LINE_AA)
+
+                # Line 3: Conf
+                if conf_text:
+                    size = 0.45
+                    cv2.putText(frame, conf_text, (text_x, base_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, size, text_color, 1, cv2.LINE_AA)
+
+
+
 
     @staticmethod
     def _compute_iou(a: DetectionResult, b: DetectionResult) -> float:
@@ -621,7 +690,7 @@ class FrameProcessor(QtCore.QObject):
             if inside:
                 # Use raw YOLO output (before stabilizer) so the history reflects
                 # the actual per-frame model prediction, not the smoothed class.
-                if raw_class_map and track_id in raw_class_map:
+                if raw_class_map is not None and track_id in raw_class_map:
                     cls_name, conf = raw_class_map[track_id]
                 else:
                     cls_name = det.cls_name
@@ -629,6 +698,7 @@ class FrameProcessor(QtCore.QObject):
 
                 history = self._id_class_history.setdefault(track_id, [])
                 history.append((cls_name, conf))
+                print("COLLECT:", track_id, cls_name, conf)
 
                 # Cap history size to prevent memory growth (keep most recent 20 frames)
                 if len(history) > self._max_zone_history:
@@ -712,12 +782,24 @@ class FrameProcessor(QtCore.QObject):
                 best_cls = name
 
         if best_cls is not None:
-            self._final_classes[track_id] = best_cls
+            final_cls_str = str(best_cls)
+            if getattr(self, "operating_mode", 1) == 1:
+                if final_cls_str.lower() == "potato":
+                    final_cls_str = "Good Potato"
+                else:
+                    final_cls_str = "Defective Potato"
+            else:
+                final_cls_str = self.detector.localized_names.get(final_cls_str, final_cls_str)
+                    
+            self._final_classes[track_id] = final_cls_str
+            self._final_confidences[track_id] = best_avg_conf
+            self._on_track_finalized(track_id, final_cls_str)
+            print("FINAL:", track_id, final_cls_str, best_avg_conf)
             if _DEBUG:
                 logger.debug(
                     "DEFINE zone: id=%d %s → final class='%s' (avg_conf=%.3f, %d obs); "
                     "track_id ADDED to countable_ids",
-                    track_id, reason, best_cls, best_avg_conf, total_obs,
+                    track_id, reason, final_cls_str, best_avg_conf, total_obs,
                 )
         elif _DEBUG:
             logger.warning(
@@ -726,6 +808,14 @@ class FrameProcessor(QtCore.QObject):
             )
 
 
+    def _on_track_finalized(self, track_id: int, final_cls: str) -> None:
+        """Called when a final class is established. Updates deferred quality stats."""
+        if track_id in self._pending_quality_stats:
+            # Move from N/A to the established quality class
+            self.stats_manager.move_na_to_quality(final_cls)
+            self._pending_quality_stats.remove(track_id)
+            pass
+            
 def load_yaml_config(path: str = "config.yaml") -> dict:
     if not os.path.exists(path):
         return {}
@@ -795,10 +885,12 @@ def build_and_run() -> None:
     else:
         counting_mode = CountingMode.LINE_CROSSING
 
+    # System config
+    operating_mode = int(cfg.get("system", {}).get("operating_mode", 1))
+
     # Counting line will be defined interactively by the user,
     # so do not create a default line here.
     line_config = None
-
     zone_raw = counting_cfg.get("zone", {})
     zone_config = ZoneCountingConfig(
         x1=int(zone_raw.get("x1", 0)),
@@ -821,9 +913,9 @@ def build_and_run() -> None:
     )
 
     processor = FrameProcessor(
-        capture_cfg,
-        preprocess_cfg,
-        db_cfg,
+        capture_config=capture_cfg,
+        preprocess_config=preprocess_cfg,
+        db_config=db_cfg,
         model_path=model_path,
         model_device=model_device,
         det_conf=det_conf,
@@ -832,7 +924,18 @@ def build_and_run() -> None:
         line_config=line_config,
         zone_config=zone_config,
         direction_config=direction_config,
+        operating_mode=operating_mode,
+        parent=None,
     )
+    
+    window.box_margin_changed.connect(lambda val: setattr(processor, 'box_margin', val))
+    window.display_mode_toggled.connect(lambda mode: setattr(processor, 'operating_mode', mode))
+    
+    window.operating_mode = operating_mode
+    if operating_mode == 1:
+        window.display_mode_btn.setText("Mode: Good/Defect")
+    else:
+        window.display_mode_btn.setText("Mode: All Classes")
 
     # Connect UI controls
     def on_start() -> None:

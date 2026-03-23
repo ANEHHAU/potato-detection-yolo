@@ -215,6 +215,8 @@ class MainWindow(QtWidgets.QMainWindow):
     count_line_selected = QtCore.pyqtSignal(object)  # ((x1, y1), (x2, y2))
     define_zone_selected = QtCore.pyqtSignal(object)  # list of (x, y)
     seek_requested = QtCore.pyqtSignal(int)  # frame index for uploaded video
+    box_margin_changed = QtCore.pyqtSignal(int)
+    display_mode_toggled = QtCore.pyqtSignal(int)
 
     def __init__(self, ui_config: Optional[UIConfig] = None) -> None:
         super().__init__()
@@ -241,7 +243,7 @@ class MainWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         main_layout = QtWidgets.QVBoxLayout(central)
 
-        # Video feed (top: original, bottom: processed / interactive)
+        # Video feed (left: original, right: processed / interactive)
         # Both widgets use identical dimensions (800x450)
         self.video_widget = VideoWidget()
         self.video_widget.setMinimumSize(800, 450)
@@ -251,14 +253,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.original_video_widget.setMinimumSize(800, 450)
         self.original_video_widget.setStyleSheet("background-color: black;")
         self.original_video_widget.set_placeholder_text("Original video")
-        self.original_video_widget.hide()
 
-        main_layout.addWidget(self.original_video_widget)
-        main_layout.addWidget(self.video_widget)
+        video_layout = QtWidgets.QHBoxLayout()
+        video_layout.addWidget(self.original_video_widget)
+        video_layout.addWidget(self.video_widget)
 
         # Ensure both video widgets keep the same size when visible
-        main_layout.setStretchFactor(self.original_video_widget, 1)
-        main_layout.setStretchFactor(self.video_widget, 1)
+        video_layout.setStretchFactor(self.original_video_widget, 1)
+        video_layout.setStretchFactor(self.video_widget, 1)
+        
+        main_layout.addLayout(video_layout)
 
         # Playback controls: timeline for uploaded videos, LIVE indicator for camera
         playback_layout = QtWidgets.QHBoxLayout()
@@ -284,17 +288,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.damaged_label = QtWidgets.QLabel("Damaged: 0")
         self.diseased_label = QtWidgets.QLabel("Diseased-fungal: 0")
         self.sprouted_label = QtWidgets.QLabel("Sprouted: 0")
-        self.defect_rate_label = QtWidgets.QLabel("Defect rate: 0.0%")
+        self.na_label = QtWidgets.QLabel("N/A: 0")
 
-        for lbl in [
-            self.total_label,
+        self.quality_labels = [
             self.good_label,
             self.defected_label,
             self.damaged_label,
             self.diseased_label,
             self.sprouted_label,
-            self.defect_rate_label,
-        ]:
+            self.na_label,
+        ]
+
+        for lbl in [self.total_label] + self.quality_labels:
             stats_layout.addWidget(lbl)
 
         main_layout.addLayout(stats_layout)
@@ -305,8 +310,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn = QtWidgets.QPushButton("Stop")
         self.auto_btn = QtWidgets.QPushButton("Auto Calibration")
         self.mode_btn = QtWidgets.QPushButton("Switch to Upload")
+        self.display_mode_btn = QtWidgets.QPushButton("Mode: Good/Defect")
         self.bg_btn = QtWidgets.QPushButton("Remove Background")
         self.bg_btn.setCheckable(True)
+        self.bg_btn.hide()  # Feature is now always-on visuals
         self.upload_btn = QtWidgets.QPushButton("Upload Video")
         self.roi_btn = QtWidgets.QPushButton("Set ROI")
         self.zone_btn = QtWidgets.QPushButton("Set Define Zone")
@@ -317,7 +324,8 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_layout.addWidget(self.stop_btn)
         btn_layout.addWidget(self.auto_btn)
         btn_layout.addWidget(self.mode_btn)
-        btn_layout.addWidget(self.bg_btn)
+        btn_layout.addWidget(self.display_mode_btn)
+        # bg_btn is hidden and omitted from layout to satisfy requirements
         btn_layout.addWidget(self.upload_btn)
         btn_layout.addWidget(self.roi_btn)
         btn_layout.addWidget(self.zone_btn)
@@ -343,9 +351,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.detection_conf_slider.setMaximum(90)  # 0.9
         self.detection_conf_slider.setValue(40)
 
+        self.box_margin_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.box_margin_slider.setMinimum(0)
+        self.box_margin_slider.setMaximum(50)
+        self.box_margin_slider.setValue(10)
+
         sliders_layout.addRow("Brightness", self.brightness_slider)
         sliders_layout.addRow("Contrast", self.contrast_slider)
         sliders_layout.addRow("Detection confidence", self.detection_conf_slider)
+        sliders_layout.addRow("Box margin", self.box_margin_slider)
 
         main_layout.addLayout(sliders_layout)
 
@@ -357,6 +371,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stop_btn.clicked.connect(self._on_stop_clicked)
         self.auto_btn.clicked.connect(self.auto_calibrate_requested.emit)
         self.mode_btn.clicked.connect(self._on_toggle_mode)
+        self.display_mode_btn.clicked.connect(self._on_toggle_display_mode)
         self.bg_btn.clicked.connect(self._on_toggle_background)
         self.upload_btn.clicked.connect(self._on_upload_video)
         self.roi_btn.clicked.connect(self._on_toggle_roi_mode)
@@ -366,6 +381,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.brightness_slider.valueChanged.connect(self._on_brightness_changed)
         self.contrast_slider.valueChanged.connect(self._on_contrast_changed)
         self.detection_conf_slider.valueChanged.connect(self._on_detection_conf_changed)
+        self.box_margin_slider.valueChanged.connect(self.box_margin_changed.emit)
 
         # Forward selection signals from video widget
         self.video_widget.roi_selected.connect(self.roi_selected)
@@ -390,13 +406,35 @@ class MainWindow(QtWidgets.QMainWindow):
             self.video_widget.show_frame(processed_frame)
 
     def update_stats(self, stats: PotatoStats) -> None:
+        mode = getattr(self, "operating_mode", 1)
         self.total_label.setText(f"Total: {stats.total}")
-        self.good_label.setText(f"Good: {stats.good}")
-        self.defected_label.setText(f"Defected: {stats.defected}")
-        self.damaged_label.setText(f"Damaged: {stats.damaged}")
-        self.diseased_label.setText(f"Diseased-fungal: {stats.diseased_fungal}")
-        self.sprouted_label.setText(f"Sprouted: {stats.sprouted}")
-        self.defect_rate_label.setText(f"Defect rate: {stats.defect_rate:.1f}%")
+        self.na_label.setText(f"N/A: {stats.na}")
+        self.na_label.show()
+        
+        if mode == 1:
+            self.good_label.show()
+            self.defected_label.show()
+            # Calculate sum of all defect categories
+            defects = stats.defected + stats.damaged + stats.diseased_fungal + stats.sprouted
+            self.defected_label.setText(f"Defect: {defects}")
+            self.good_label.setText(f"Good: {stats.good}")
+            # Hide the others
+            self.damaged_label.hide()
+            self.diseased_label.hide()
+            self.sprouted_label.hide()
+        else:
+            # Show all 5 classes
+            self.good_label.show()
+            self.defected_label.show()
+            self.damaged_label.show()
+            self.diseased_label.show()
+            self.sprouted_label.show()
+            
+            self.good_label.setText(f"Good: {stats.good}")
+            self.defected_label.setText(f"Defected: {stats.defected}")
+            self.damaged_label.setText(f"Damaged: {stats.damaged}")
+            self.diseased_label.setText(f"Diseased-fungal: {stats.diseased_fungal}")
+            self.sprouted_label.setText(f"Sprouted: {stats.sprouted}")
 
         self._check_alarm(stats)
 
@@ -466,13 +504,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_stop_button_label()
 
     def _on_toggle_background(self) -> None:
-        enabled = self.bg_btn.isChecked()
-        self.background_toggled.emit(enabled)
-        # Show / hide original panel when background removal is active
-        if enabled:
-            self.original_video_widget.show()
+        pass  # Toggle disabled; original and processed widgets naturally run side by side
+
+    def _on_toggle_display_mode(self) -> None:
+        self.operating_mode = 2 if getattr(self, 'operating_mode', 1) == 1 else 1
+        if self.operating_mode == 1:
+            self.display_mode_btn.setText("Mode: Good/Defect")
         else:
-            self.original_video_widget.hide()
+            self.display_mode_btn.setText("Mode: All Classes")
+        self.display_mode_toggled.emit(self.operating_mode)
 
     def _on_toggle_roi_mode(self) -> None:
         if self.video_widget._mode != "roi":

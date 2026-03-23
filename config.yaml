@@ -1,3 +1,6 @@
+system:
+  operating_mode: 1  # 1: Good/Defective mode, 2: Full classes mode
+
 video:
   # Camera source:
   # - 0,1,... for USB cameras

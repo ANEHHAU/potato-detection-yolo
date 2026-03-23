@@ -1,0 +1,86 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Potato Detection</title>
+</head>
+<body style="background:black; color:white; text-align:center; padding:50px;">
+
+    <h1>🥔 Potato Detection App</h1>
+
+    <form method="POST" enctype="multipart/form-data">
+        <input type="file" name="video" required>
+        <br><br>
+        <button type="submit">Upload & Detect</button>
+    </form>
+
+    {% if result_video %}
+        <h2>Kết quả:</h2>
+        <video width="600" controls>
+            <source src="{{ result_video }}" type="video/mp4">
+        </video>
+    {% endif %}
+
+</body>
+</html>
+
+<!-- <!DOCTYPE html>
+<html>
+<head>
+    <title>Potato Detection App</title>
+    <style>
+        body {
+            font-family: Arial;
+            background: #111;
+            color: white;
+            text-align: center;
+            padding: 40px;
+        }
+
+        .box {
+            background: #222;
+            padding: 30px;
+            border-radius: 10px;
+            width: 500px;
+            margin: auto;
+        }
+
+        input, button {
+            padding: 10px;
+            margin: 10px;
+        }
+
+        video {
+            margin-top: 20px;
+            width: 100%;
+            border-radius: 10px;
+        }
+
+        button {
+            background: #00ff99;
+            border: none;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>🥔 Potato Detection Web App</h1>
+
+    <div class="box">
+        <form method="POST" enctype="multipart/form-data">
+            <input type="file" name="video" accept="video/*" required>
+            <br>
+            <button type="submit">Upload & Detect</button>
+        </form>
+
+        {% if result_video %}
+            <h3>Kết quả:</h3>
+            <video controls>
+                <source src="{{ result_video }}" type="video/mp4">
+            </video>
+        {% endif %}
+    </div>
+
+</body>
+</html> -->
