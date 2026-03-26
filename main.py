@@ -448,8 +448,18 @@ class FrameProcessor(QtCore.QObject):
         # the object has exited the DEFINE ZONE.
         self._draw_overlays(processed, all_detections)
 
+        # ── STAGE 13: COMPOSITE — inside ROI = processed, outside ROI = original ──
+        # Keep the raw camera pixels pristine outside the ROI boundary.
+        if self.roi_polygon and len(self.roi_polygon) >= 3:
+            roi_mask = self._build_roi_mask(base_frame.shape[:2])
+            # 3-channel mask for per-pixel blending
+            roi_mask_3c = cv2.merge([roi_mask, roi_mask, roi_mask])
+            final_frame = np.where(roi_mask_3c == 255, processed, base_frame)
+        else:
+            final_frame = processed
+
         # Emit frames and stats to the UI
-        self.frame_processed.emit(base_frame, processed, self.stats_manager.stats)
+        self.frame_processed.emit(base_frame, final_frame, self.stats_manager.stats)
 
         # Timeline slider update for uploaded videos
         if self.video.is_file_source() and self.video.is_opened():
@@ -526,11 +536,20 @@ class FrameProcessor(QtCore.QObject):
 
         # Draw detections
         h, w = frame.shape[:2]
+        _LABEL_COLOR = (255, 0, 0)    # Dark Blue (BGR) — main text
+        _SHADOW_COLOR = (0, 0, 0)     # Black outline for readability
+        _DEFINING_COLOR = (255, 0, 255)  # Purple — object still being classified
+
+        def _put_text_outlined(img, text, org, font, scale, color, thickness=1):
+            """Draw text with a black shadow/outline then the main colour on top."""
+            cv2.putText(img, text, org, font, scale, _SHADOW_COLOR, thickness + 1, cv2.LINE_AA)
+            cv2.putText(img, text, org, font, scale, color, thickness, cv2.LINE_AA)
+
         for det in detections:
             if hasattr(det, 'rotated_box'):
                 cv2.polylines(frame, [det.rotated_box], isClosed=True, color=(0, 255, 0), thickness=1)
-                text_x = max(0, det.rotated_box[:, 0].min())
-                text_y = max(0, det.rotated_box[:, 1].min())
+                text_x = max(0, int(det.rotated_box[:, 0].min()))
+                text_y = max(0, int(det.rotated_box[:, 1].min()))
             else:
                 text_x = max(0, det.x1 - self.box_margin)
                 text_y = max(0, det.y1 - self.box_margin)
@@ -542,20 +561,20 @@ class FrameProcessor(QtCore.QObject):
                 # Class label display rule
                 class_text = ""
                 conf_text = ""
-                text_color = (200, 200, 200)  # Light gray
+                label_color = _LABEL_COLOR  # Default: dark blue
                 cx, cy = det.center
                 dz_poly = self.define_zone_polygon
-                
+
                 # Check Define Zone validity
                 is_zone_valid = dz_poly is not None and len(dz_poly) >= 3
-                
+
                 if not is_zone_valid:
                     # Zone Invalid: ALWAYS N/A
                     class_text = "N/A"
                 else:
                     # Zone Valid: Check priorities
                     if det.track_id in self._final_classes:
-                        # Priority 1: Final class (Yellow)
+                        # Priority 1: Final class assigned after exiting Define Zone
                         final_cls = self._final_classes[det.track_id]
                         conf_val = self._final_confidences.get(det.track_id, 0.0) * 100
                         if getattr(self, "operating_mode", 1) == 1:
@@ -563,33 +582,41 @@ class FrameProcessor(QtCore.QObject):
                         else:
                             class_text = self.detector.localized_names.get(final_cls, final_cls)
                         conf_text = f"{conf_val:.0f}%"
-                        text_color = (0, 255, 255)
+                        label_color = _LABEL_COLOR
                     elif self._point_in_polygon(dz_poly, cx, cy):
-                        # Priority 2: Inside Zone (Purple)
+                        # Priority 2: Inside Define Zone — still being classified
                         class_text = "DEFINING"
-                        text_color = (255, 0, 255)
+                        label_color = _DEFINING_COLOR
                     else:
-                        # Priority 3: Fallback (Gray)
+                        # Priority 3: Outside zone, no final class yet
                         class_text = "N/A"
 
-                # Safely stack lines to prevent out-of-screen rendering
-                base_y = max(35, text_y)
+                # Safely stack 3 lines above the bounding box
+                # Line spacing: 16px each; ensure we stay on screen
+                base_y = max(50, text_y - 2)
 
-                # Line 1: ID
-                cv2.putText(frame, f"ID: {det.track_id}", (text_x, base_y - 24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, text_color, 1, cv2.LINE_AA)
+                # Line 1: ID: <id>
+                _put_text_outlined(
+                    frame, f"ID: {det.track_id}",
+                    (text_x, base_y - 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, label_color
+                )
 
-                # Line 2: Class
+                # Line 2: <class_name>
                 if class_text:
-                    size = 0.45
-                    cv2.putText(frame, class_text, (text_x, base_y - 12),
-                                cv2.FONT_HERSHEY_SIMPLEX, size, text_color, 1, cv2.LINE_AA)
+                    _put_text_outlined(
+                        frame, class_text,
+                        (text_x, base_y - 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, label_color
+                    )
 
-                # Line 3: Conf
+                # Line 3: <confidence>%
                 if conf_text:
-                    size = 0.45
-                    cv2.putText(frame, conf_text, (text_x, base_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, size, text_color, 1, cv2.LINE_AA)
+                    _put_text_outlined(
+                        frame, conf_text,
+                        (text_x, base_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, label_color
+                    )
 
 
 
