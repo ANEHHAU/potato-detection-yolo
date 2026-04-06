@@ -107,9 +107,12 @@ class FrameProcessor(QtCore.QObject):
         self._final_classes: Dict[int, str] = {}
         self._final_confidences: Dict[int, float] = {}
         # Minimum number of observations inside Define Zone before fixing class
-        self._min_define_zone_observations: int = 1
+        self._min_define_zone_observations: int = 5
         # Maximum predictions kept per track_id in zone history (prevents memory growth)
         self._max_zone_history: int = 20
+        # Exit buffer: track_id -> consecutive frames outside zone after being inside
+        self._exit_buffer: Dict[int, int] = {}
+        self._max_exit_frames: int = 3
 
         # Tracking lifetime for filtering out very short-lived false positives
         self._track_total_frames: Dict[int, int] = {}
@@ -202,6 +205,11 @@ class FrameProcessor(QtCore.QObject):
         )
         self._lost_tracks.clear()
         self._pending_quality_stats.clear()
+        self._exit_buffer.clear()
+        self._id_class_history.clear()
+        self._final_classes.clear()
+        self._final_confidences.clear()
+        self._define_zone_inside.clear()
 
     def preview_first_frame(self) -> None:
         """
@@ -364,24 +372,25 @@ class FrameProcessor(QtCore.QObject):
                     contours, _ = cv2.findContours(crop_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if contours:
                         c = max(contours, key=cv2.contourArea)
-                        rect = cv2.minAreaRect(c)
-                        center = (rect[0][0] + x1, rect[0][1] + y1)
-                        size = (rect[1][0] + 2 * self.box_margin, rect[1][1] + 2 * self.box_margin)
-                        expanded_rect = (center, size, rect[2])
-                        box = cv2.boxPoints(expanded_rect)
-                        det.rotated_box = np.array(box, dtype=np.int32)
+                        bx, by, bw, bh = cv2.boundingRect(c)
+                        # Refined axis-aligned box based on contour, adding margin
+                        rx1 = max(0, x1 + bx - self.box_margin)
+                        ry1 = max(0, y1 + by - self.box_margin)
+                        rx2 = min(w, x1 + bx + bw + self.box_margin)
+                        ry2 = min(h, y1 + by + bh + self.box_margin)
+                        det.tight_box = np.array([[rx1, ry1], [rx2, ry1], [rx2, ry2], [rx1, ry2]], dtype=np.int32)
                     else:
-                        det.rotated_box = np.array([[x1 - self.box_margin, y1 - self.box_margin],
+                        det.tight_box = np.array([[x1 - self.box_margin, y1 - self.box_margin],
                                                     [x2 + self.box_margin, y1 - self.box_margin],
                                                     [x2 + self.box_margin, y2 + self.box_margin],
                                                     [x1 - self.box_margin, y2 + self.box_margin]], dtype=np.int32)
                 else:
-                    det.rotated_box = np.array([[x1 - self.box_margin, y1 - self.box_margin],
+                    det.tight_box = np.array([[x1 - self.box_margin, y1 - self.box_margin],
                                                 [x2 + self.box_margin, y1 - self.box_margin],
                                                 [x2 + self.box_margin, y2 + self.box_margin],
                                                 [x1 - self.box_margin, y2 + self.box_margin]], dtype=np.int32)
                 
-                cv2.fillPoly(potato_mask, [det.rotated_box], 255)
+                cv2.fillPoly(potato_mask, [det.tight_box], 255)
             
             processed[potato_mask == 0] = [255, 255, 255]
 
@@ -546,16 +555,16 @@ class FrameProcessor(QtCore.QObject):
             cv2.putText(img, text, org, font, scale, color, thickness, cv2.LINE_AA)
 
         for det in detections:
-            if hasattr(det, 'rotated_box'):
-                cv2.polylines(frame, [det.rotated_box], isClosed=True, color=(0, 255, 0), thickness=1)
-                text_x = max(0, int(det.rotated_box[:, 0].min()))
-                text_y = max(0, int(det.rotated_box[:, 1].min()))
+            if hasattr(det, 'tight_box'):
+                cv2.polylines(frame, [det.tight_box], isClosed=True, color=(0, 255, 0), thickness=1)
+                text_x = max(0, int(det.tight_box[:, 0].min()))
+                text_y = max(0, int(det.tight_box[:, 1].min()))
             else:
                 text_x = max(0, det.x1 - self.box_margin)
                 text_y = max(0, det.y1 - self.box_margin)
-                x2 = min(w, det.x2 + self.box_margin)
-                y2 = min(h, det.y2 + self.box_margin)
-                cv2.rectangle(frame, (text_x, text_y), (x2, y2), (0, 255, 0), 1)
+                rx2 = min(w, det.x2 + self.box_margin)
+                ry2 = min(h, det.y2 + self.box_margin)
+                cv2.rectangle(frame, (text_x, text_y), (rx2, ry2), (0, 255, 0), 1)
 
             if det.track_id is not None:
                 # Class label display rule
@@ -746,31 +755,42 @@ class FrameProcessor(QtCore.QObject):
                         )
 
             # ----- FINALIZE when object transitions from inside → outside zone -----
-            # This is the ONLY place final class is assigned.
+            # To prevent premature finalization due to noise, we require the object
+            # to be outside the zone for several consecutive frames.
             if was_inside and not inside:
-                logger.debug(
-                    "DEFINE zone: id=%d LEFT zone at frame %d — finalizing class",
-                    track_id, self._frame_index,
-                ) if _DEBUG else None
-                self._finalize_class_from_history(track_id, reason="exited")
+                self._exit_buffer[track_id] = self._exit_buffer.get(track_id, 0) + 1
+                if self._exit_buffer[track_id] >= self._max_exit_frames:
+                    if _DEBUG:
+                        logger.debug(
+                            "DEFINE zone: id=%d LEFT zone (buffer full) — finalizing class",
+                            track_id
+                        )
+                    self._finalize_class_from_history(track_id, reason="exited")
+            else:
+                # If it's inside or was never inside, reset exit buffer
+                self._exit_buffer.pop(track_id, None)
 
-            # Update inside-flag for next frame
-            self._define_zone_inside[track_id] = inside
+            # Update inside-flag for next frame: maintain "was_inside" state while in buffer
+            is_still_buffered_exit = (was_inside and not inside and self._exit_buffer.get(track_id, 0) < self._max_exit_frames)
+            self._define_zone_inside[track_id] = (inside or is_still_buffered_exit)
 
         # ----- Handle tracks that disappeared while inside Define Zone -----
-        # (e.g., tracking lost, object left frame without exiting zone cleanly)
+        # We only finalize if they have been gone for at least _max_lost_frames
+        # and they were truly inside (no longer appearing in Fail-Safe buffer).
         for track_id, was_inside in list(self._define_zone_inside.items()):
-            if not was_inside or track_id in current_ids:
+            if track_id in current_ids:
                 continue
-            if track_id in self._final_classes:
+            if not was_inside or track_id in self._final_classes:
                 continue
-            # Track disappeared while inside zone — finalize its class from collected history
-            if _DEBUG:
-                logger.debug(
-                    "DEFINE zone: id=%d DISAPPEARED inside zone (frame %d) — finalizing class",
-                    track_id, self._frame_index,
-                )
-            self._finalize_class_from_history(track_id, reason="disappeared")
+            
+            # If the track is completely gone (not even in self._lost_tracks buffer), finalize it.
+            if track_id not in self._lost_tracks:
+                if _DEBUG:
+                    logger.debug(
+                        "DEFINE zone: id=%d DISAPPEARED inside zone (buffer empty) — finalizing class",
+                        track_id
+                    )
+                self._finalize_class_from_history(track_id, reason="disappeared")
 
     def _finalize_class_from_history(self, track_id: int, reason: str = "exited") -> None:
         """
